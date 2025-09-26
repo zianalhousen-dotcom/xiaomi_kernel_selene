@@ -1,0 +1,127 @@
+name: Build Selene Kernel (NetHunter-ready)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - twelve
+      - '**/build/*'
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-latest
+    env:
+      ARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+      WORKDIR: ${{ github.workspace }}/build
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup build dir
+        run: |
+          mkdir -p $WORKDIR
+          cd $WORKDIR
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git build-essential bc ccache flex bison libncurses5-dev libncursesw5-dev \
+            libelf-dev libssl-dev zip unzip gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            wget python3
+
+      - name: Copy kernel source into build dir
+        run: |
+          rsync -a --exclude='.git' ${{ github.workspace }}/ $WORKDIR/kernel-src/
+          cd $WORKDIR/kernel-src
+
+      - name: Select branch (try 'twelve' if present)
+        run: |
+          cd $WORKDIR/kernel-src
+          if git show-ref --verify --quiet refs/remotes/origin/twelve; then
+            git checkout twelve || true
+            echo "Checked out branch: twelve"
+          else
+            echo "Branch 'twelve' not found, using current branch"
+          fi
+
+      - name: Prepare defconfig
+        run: |
+          cd $WORKDIR/kernel-src
+          if [ -f arch/arm64/configs/vendor_selene_defconfig ]; then
+            cp arch/arm64/configs/vendor_selene_defconfig .config
+            echo "Using vendor_selene_defconfig"
+          else
+            echo "vendor_selene_defconfig not found, running make defconfig"
+            make ARCH=arm64 CROSS_COMPILE=$CROSS_COMPILE defconfig
+          fi
+
+      - name: Enable NetHunter-related Kconfigs (best-effort)
+        run: |
+          cd $WORKDIR/kernel-src
+          set +e
+          opts=(
+            CONFIG_USB_GADGET CONFIG_USB_CONFIGFS CONFIG_USB_FUNCTIONFS CONFIG_NETFILTER
+            CONFIG_ANDROID_PARANOID_NETWORK CONFIG_KALLSYMS CONFIG_DEBUG_INFO
+            CONFIG_CFG80211 CONFIG_MAC80211 CONFIG_ATH9K CONFIG_RTL8187 CONFIG_RT2800USB
+            CONFIG_BT CONFIG_BT_RFCOMM CONFIG_BT_HCIBTUSB CONFIG_NF_CONNTRACK CONFIG_NF_NAT
+          )
+          if [ -x scripts/config ]; then
+            for o in "${opts[@]}"; do
+              echo "Trying to enable $o"
+              scripts/config --enable "$o" >/dev/null 2>&1 || scripts/config --enable "${o#CONFIG_}" >/dev/null 2>&1 || echo "Skip $o"
+            done
+            make ARCH=arm64 CROSS_COMPILE=$CROSS_COMPILE olddefconfig || true
+          else
+            for o in "${opts[@]}"; do
+              if ! grep -q "^${o}=" .config 2>/dev/null; then
+                echo "${o}=y" >> .config || true
+              fi
+            done
+            make ARCH=arm64 CROSS_COMPILE=$CROSS_COMPILE olddefconfig || true
+          fi
+          set -e
+
+      - name: Build kernel
+        run: |
+          cd $WORKDIR/kernel-src
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make -j$(nproc) ARCH=arm64 CROSS_COMPILE=$CROSS_COMPILE 2>&1 | tee build_output.log
+        timeout-minutes: 60
+
+      - name: Prepare AnyKernel3 and package zip
+        run: |
+          cd $WORKDIR
+          rm -rf AnyKernel3 || true
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git
+          cd AnyKernel3
+          if [ -f $WORKDIR/kernel-src/arch/arm64/boot/Image.gz-dtb ]; then
+            cp $WORKDIR/kernel-src/arch/arm64/boot/Image.gz-dtb kernel
+          elif [ -f $WORKDIR/kernel-src/arch/arm64/boot/Image.gz ]; then
+            cp $WORKDIR/kernel-src/arch/arm64/boot/Image.gz kernel
+          elif [ -f $WORKDIR/kernel-src/arch/arm64/boot/Image ]; then
+            cp $WORKDIR/kernel-src/arch/arm64/boot/Image kernel
+          else
+            echo "No kernel image found; aborting packaging"; exit 1
+          fi
+          OUTZIP=$WORKDIR/Selene_NethunterKernel_$(date +%Y%m%d_%H%M).zip
+          zip -r "$OUTZIP" ./* >/dev/null 2>&1 || zip -r "$OUTZIP" *
+          echo "Created $OUTZIP"
+          ls -lh "$OUTZIP"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: selene-nethunter-kernel
+          path: ${{ env.WORKDIR }}/Selene_NethunterKernel_*.zip
+
+      - name: Upload build log
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ env.WORKDIR }}/kernel-src/build_output.log
