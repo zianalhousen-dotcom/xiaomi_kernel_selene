@@ -1,127 +1,62 @@
-name: Build Selene Kernel (NetHunter-ready)
+name: Fast Kernel Build NetHunter - Redmi 10
 
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - main
-      - twelve
-      - '**/build/*'
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
-  build-kernel:
+  build:
     runs-on: ubuntu-latest
-    env:
-      ARCH: arm64
-      CROSS_COMPILE: aarch64-linux-gnu-
-      WORKDIR: ${{ github.workspace }}/build
+    timeout-minutes: 90  # توقف تلقائي بعد ساعة ونصف إذا علق
+
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+    - name: Checkout source
+      uses: actions/checkout@v3
 
-      - name: Setup build dir
-        run: |
-          mkdir -p $WORKDIR
-          cd $WORKDIR
+    - name: Set WORKDIR
+      run: |
+        export WORKDIR=$GITHUB_WORKSPACE/build
+        mkdir -p $WORKDIR/kernel-src
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            git build-essential bc ccache flex bison libncurses5-dev libncursesw5-dev \
-            libelf-dev libssl-dev zip unzip gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-            wget python3
+    - name: Cache essential toolchain
+      uses: actions/cache@v3
+      with:
+        path: toolchain
+        key: ${{ runner.os }}-toolchain-${{ hashFiles('toolchain_version.txt') }}
 
-      - name: Copy kernel source into build dir
-        run: |
-          rsync -a --exclude='.git' ${{ github.workspace }}/ $WORKDIR/kernel-src/
-          cd $WORKDIR/kernel-src
+    - name: Setup prebuilt toolchain
+      run: |
+        mkdir -p toolchain
+        if [ ! -f toolchain/clang ]; then
+          echo "Downloading prebuilt toolchain..."
+          curl -L -o toolchain/clang.tar.gz https://example.com/toolchain.tar.gz
+          tar -xzf toolchain/clang.tar.gz -C toolchain
+        fi
+        echo "Toolchain ready"
 
-      - name: Select branch (try 'twelve' if present)
-        run: |
-          cd $WORKDIR/kernel-src
-          if git show-ref --verify --quiet refs/remotes/origin/twelve; then
-            git checkout twelve || true
-            echo "Checked out branch: twelve"
-          else
-            echo "Branch 'twelve' not found, using current branch"
-          fi
+    - name: Clean previous build output
+      run: |
+        rm -rf out/
+        mkdir -p out
 
-      - name: Prepare defconfig
-        run: |
-          cd $WORKDIR/kernel-src
-          if [ -f arch/arm64/configs/vendor_selene_defconfig ]; then
-            cp arch/arm64/configs/vendor_selene_defconfig .config
-            echo "Using vendor_selene_defconfig"
-          else
-            echo "vendor_selene_defconfig not found, running make defconfig"
-            make ARCH=arm64 CROSS_COMPILE=$CROSS_COMPILE defconfig
-          fi
+    - name: Copy Kernel Source
+      run: |
+        rsync -a --exclude='.git' $GITHUB_WORKSPACE/ $WORKDIR/kernel-src/
 
-      - name: Enable NetHunter-related Kconfigs (best-effort)
-        run: |
-          cd $WORKDIR/kernel-src
-          set +e
-          opts=(
-            CONFIG_USB_GADGET CONFIG_USB_CONFIGFS CONFIG_USB_FUNCTIONFS CONFIG_NETFILTER
-            CONFIG_ANDROID_PARANOID_NETWORK CONFIG_KALLSYMS CONFIG_DEBUG_INFO
-            CONFIG_CFG80211 CONFIG_MAC80211 CONFIG_ATH9K CONFIG_RTL8187 CONFIG_RT2800USB
-            CONFIG_BT CONFIG_BT_RFCOMM CONFIG_BT_HCIBTUSB CONFIG_NF_CONNTRACK CONFIG_NF_NAT
-          )
-          if [ -x scripts/config ]; then
-            for o in "${opts[@]}"; do
-              echo "Trying to enable $o"
-              scripts/config --enable "$o" >/dev/null 2>&1 || scripts/config --enable "${o#CONFIG_}" >/dev/null 2>&1 || echo "Skip $o"
-            done
-            make ARCH=arm64 CROSS_COMPILE=$CROSS_COMPILE olddefconfig || true
-          else
-            for o in "${opts[@]}"; do
-              if ! grep -q "^${o}=" .config 2>/dev/null; then
-                echo "${o}=y" >> .config || true
-              fi
-            done
-            make ARCH=arm64 CROSS_COMPILE=$CROSS_COMPILE olddefconfig || true
-          fi
-          set -e
+    - name: Build Kernel Core (light logging)
+      run: |
+        make O=out ARCH=arm64 CROSS_COMPILE=toolchain/aarch64-linux-gnu- -j2 V=1 2>&1 | tail -n 300 | tee build.log
+      continue-on-error: false
 
-      - name: Build kernel
-        run: |
-          cd $WORKDIR/kernel-src
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          make -j$(nproc) ARCH=arm64 CROSS_COMPILE=$CROSS_COMPILE 2>&1 | tee build_output.log
-        timeout-minutes: 60
+    - name: Upload build log
+      uses: actions/upload-artifact@v3
+      with:
+        name: build-log
+        path: build.log
 
-      - name: Prepare AnyKernel3 and package zip
-        run: |
-          cd $WORKDIR
-          rm -rf AnyKernel3 || true
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git
-          cd AnyKernel3
-          if [ -f $WORKDIR/kernel-src/arch/arm64/boot/Image.gz-dtb ]; then
-            cp $WORKDIR/kernel-src/arch/arm64/boot/Image.gz-dtb kernel
-          elif [ -f $WORKDIR/kernel-src/arch/arm64/boot/Image.gz ]; then
-            cp $WORKDIR/kernel-src/arch/arm64/boot/Image.gz kernel
-          elif [ -f $WORKDIR/kernel-src/arch/arm64/boot/Image ]; then
-            cp $WORKDIR/kernel-src/arch/arm64/boot/Image kernel
-          else
-            echo "No kernel image found; aborting packaging"; exit 1
-          fi
-          OUTZIP=$WORKDIR/Selene_NethunterKernel_$(date +%Y%m%d_%H%M).zip
-          zip -r "$OUTZIP" ./* >/dev/null 2>&1 || zip -r "$OUTZIP" *
-          echo "Created $OUTZIP"
-          ls -lh "$OUTZIP"
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: selene-nethunter-kernel
-          path: ${{ env.WORKDIR }}/Selene_NethunterKernel_*.zip
-
-      - name: Upload build log
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: ${{ env.WORKDIR }}/kernel-src/build_output.log
+    - name: Upload built kernel
+      uses: actions/upload-artifact@v3
+      with:
+        name: kernel-artifacts
+        path: out/
